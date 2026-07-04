@@ -1,0 +1,102 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #f2f3fa;
+  --surface: #ffffff;
+  --surface-2: #e9ebf7;
+  --ink: #1b2140;
+  --muted: #6a7090;
+  --accent: #4c5bf5;
+  --on-accent: #ffffff;
+  --accent-soft: #e4e8ff;
+  --signal: #1fa565;
+  --line: #d9dcee;
+  --danger: #d4404f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1226;
+    --surface: #181c38;
+    --surface-2: #21264a;
+    --ink: #e9ebfa;
+    --muted: #979dc4;
+    --accent: #7e8aff;
+    --on-accent: #10132b;
+    --accent-soft: #272c55;
+    --signal: #35c380;
+    --line: #2b3054;
+    --danger: #ff7583;
+  }
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-signal: var(--signal);
+  --color-line: var(--line);
+  --color-danger: var(--danger);
+  --font-display: var(--font-bricolage), system-ui, sans-serif;
+  --font-body: var(--font-instrument), system-ui, sans-serif;
+  --font-code: var(--font-space-mono), ui-monospace, monospace;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Safe area untuk PWA iOS (notch / home indicator) */
+.pb-safe {
+  padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+}
+.pt-safe {
+  padding-top: max(0.5rem, env(safe-area-inset-top));
+}
+
+@keyframes msg-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.msg-in {
+  animation: msg-in 180ms ease-out;
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--signal) 45%, transparent);
+  }
+  60% {
+    box-shadow: 0 0 0 5px transparent;
+  }
+}
+.pulse-dot {
+  animation: pulse-dot 2.2s ease-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg-in,
+  .pulse-dot {
+    animation: none;
+  }
+}
