@@ -2,17 +2,23 @@
 
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { RealtimeChannel } from "@supabase/supabase-js";
-import { getSupabase, isSupabaseConfigured } from "@/lib/supabase";
 import { validateMessage, validateUsername } from "@/lib/validation";
-import type { ChatMessage, RoomItem } from "@/lib/types";
+import { decode, type ClientMsg, type ServerEvent } from "@/lib/ws-protocol";
+import type { RoomItem } from "@/lib/types";
 import MessageList from "@/components/MessageList";
 import MessageInput from "@/components/MessageInput";
 import OnlineUsers from "@/components/OnlineUsers";
 
 const SEND_COOLDOWN_MS = 300;
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS = 8000;
 
 type Status = "connecting" | "online" | "error";
+
+function wsUrl(roomId: string, username: string): string {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}/api/ws/${roomId}?u=${encodeURIComponent(username)}`;
+}
 
 export default function ChatRoom({ roomId }: { roomId: string }) {
   const router = useRouter();
@@ -21,8 +27,11 @@ export default function ChatRoom({ roomId }: { roomId: string }) {
   const [items, setItems] = useState<RoomItem[]>([]);
   const [onlineUsers, setOnlineUsers] = useState<string[]>([]);
   const [copied, setCopied] = useState(false);
-  const channelRef = useRef<RealtimeChannel | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
   const lastSentAt = useRef(0);
+  const reconnectAttempt = useRef(0);
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const closedByUser = useRef(false);
 
   // Ambil username dari sessionStorage; tanpa itu kembali ke halaman join
   useEffect(() => {
@@ -37,117 +46,88 @@ export default function ChatRoom({ roomId }: { roomId: string }) {
 
   useEffect(() => {
     if (!username) return;
-    if (!isSupabaseConfigured()) {
-      setStatus("error");
-      return;
+    closedByUser.current = false;
+
+    function connect() {
+      setStatus((prev) => (prev === "online" ? prev : "connecting"));
+      const socket = new WebSocket(wsUrl(roomId, username!));
+      socketRef.current = socket;
+
+      socket.onopen = () => {
+        reconnectAttempt.current = 0;
+        setStatus("online");
+      };
+
+      socket.onmessage = (event) => {
+        const msg = decode<ServerEvent>(String(event.data));
+        if (!msg) return;
+
+        if (msg.t === "msg") {
+          setItems((prev) => [
+            ...prev,
+            {
+              type: "message",
+              id: msg.id,
+              username: msg.username,
+              text: msg.text,
+              timestamp: msg.timestamp,
+            },
+          ]);
+        } else if (msg.t === "presence") {
+          setOnlineUsers(msg.users);
+        } else if (msg.t === "sys") {
+          setItems((prev) => [
+            ...prev,
+            {
+              type: "system",
+              id: msg.id,
+              kind: msg.kind,
+              username: msg.username,
+              timestamp: msg.timestamp,
+            },
+          ]);
+        }
+      };
+
+      socket.onclose = () => {
+        socketRef.current = null;
+        if (closedByUser.current) return;
+        setStatus("connecting");
+        const delay = Math.min(
+          RECONNECT_BASE_MS * 2 ** reconnectAttempt.current,
+          RECONNECT_MAX_MS
+        );
+        reconnectAttempt.current += 1;
+        reconnectTimer.current = setTimeout(connect, delay);
+      };
+
+      socket.onerror = () => {
+        setStatus((prev) => (prev === "online" ? prev : "error"));
+      };
     }
 
-    const supabase = getSupabase();
-    const channel = supabase.channel(`room:${roomId}`, {
-      config: {
-        broadcast: { self: true },
-        presence: { key: `${username}#${crypto.randomUUID().slice(0, 8)}` },
-      },
-    });
-    channelRef.current = channel;
-
-    channel
-      .on("broadcast", { event: "message" }, ({ payload }) => {
-        const msg = payload as ChatMessage;
-        const text = typeof msg.text === "string" ? validateMessage(msg.text) : null;
-        const name =
-          typeof msg.username === "string" ? validateUsername(msg.username) : null;
-        if (!text || !name) return; // abaikan payload tidak valid dari peer
-        setItems((prev) => [
-          ...prev,
-          {
-            type: "message",
-            id: String(msg.id ?? crypto.randomUUID()),
-            username: name,
-            text,
-            timestamp: Number(msg.timestamp) || Date.now(),
-          },
-        ]);
-      })
-      .on("presence", { event: "sync" }, () => {
-        const state = channel.presenceState<{ username: string }>();
-        const names = Object.values(state)
-          .flat()
-          .map((p) => p.username)
-          .filter(Boolean);
-        setOnlineUsers([...new Set(names)].sort());
-      })
-      .on("presence", { event: "join" }, ({ newPresences }) => {
-        for (const p of newPresences as unknown as { username?: string }[]) {
-          const name = p.username;
-          if (!name || name === username) continue;
-          setItems((prev) => [
-            ...prev,
-            {
-              type: "system",
-              id: crypto.randomUUID(),
-              kind: "join",
-              username: name,
-              timestamp: Date.now(),
-            },
-          ]);
-        }
-      })
-      .on("presence", { event: "leave" }, ({ leftPresences }) => {
-        for (const p of leftPresences as unknown as { username?: string }[]) {
-          const name = p.username;
-          if (!name) continue;
-          setItems((prev) => [
-            ...prev,
-            {
-              type: "system",
-              id: crypto.randomUUID(),
-              kind: "leave",
-              username: name,
-              timestamp: Date.now(),
-            },
-          ]);
-        }
-      })
-      .subscribe(async (state) => {
-        if (state === "SUBSCRIBED") {
-          setStatus("online");
-          await channel.track({ username, joinedAt: Date.now() });
-        } else if (state === "CHANNEL_ERROR" || state === "TIMED_OUT") {
-          setStatus("error");
-        }
-      });
+    connect();
 
     return () => {
-      channel.unsubscribe();
-      channelRef.current = null;
+      closedByUser.current = true;
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      socketRef.current?.close();
+      socketRef.current = null;
     };
   }, [roomId, username]);
 
-  const sendMessage = useCallback(
-    (raw: string): boolean => {
-      const channel = channelRef.current;
-      const text = validateMessage(raw);
-      if (!channel || !username || !text) return false;
+  const sendMessage = useCallback((raw: string): boolean => {
+    const socket = socketRef.current;
+    const text = validateMessage(raw);
+    if (!socket || socket.readyState !== WebSocket.OPEN || !text) return false;
 
-      const now = Date.now();
-      if (now - lastSentAt.current < SEND_COOLDOWN_MS) return false;
-      lastSentAt.current = now;
+    const now = Date.now();
+    if (now - lastSentAt.current < SEND_COOLDOWN_MS) return false;
+    lastSentAt.current = now;
 
-      channel.send({
-        type: "broadcast",
-        event: "message",
-        payload: {
-          id: crypto.randomUUID(),
-          username,
-          text,
-          timestamp: now,
-        } satisfies ChatMessage,
-      });
-      return true;
-    },
-    [username]
-  );
+    socket.send(JSON.stringify({ t: "msg", text } satisfies ClientMsg));
+    return true;
+  }, []);
 
   async function copyRoomId() {
     try {
@@ -181,8 +161,7 @@ export default function ChatRoom({ roomId }: { roomId: string }) {
             <p className="truncate text-xs text-muted">
               {status === "online" && `masuk sebagai ${username}`}
               {status === "connecting" && "menghubungkan…"}
-              {status === "error" &&
-                "koneksi gagal — periksa konfigurasi Supabase"}
+              {status === "error" && "koneksi gagal — mencoba lagi…"}
             </p>
           </div>
           <OnlineUsers users={onlineUsers} self={username} status={status} />

@@ -7,19 +7,22 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "icons": "node scripts/generate-icons.mjs"
+    "icons": "node scripts/generate-icons.mjs",
+    "prepare": "next-ws patch"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.49.0",
     "next": "^15.3.0",
+    "next-ws": "^2.2.8",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.0",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "@types/ws": "^8.5.0",
     "sharp": "^0.34.0",
     "tailwindcss": "^4.1.0",
     "typescript": "^5.8.0"
