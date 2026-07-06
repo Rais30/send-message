@@ -4,7 +4,8 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { validateMessage, validateUsername } from "@/lib/validation";
 import { decode, type ClientMsg, type ServerEvent } from "@/lib/ws-protocol";
-import type { RoomItem } from "@/lib/types";
+import type { ChatMessage, RoomItem } from "@/lib/types";
+import { removeRecentRoom, saveRecentRoom } from "@/lib/recent-rooms";
 import MessageList from "@/components/MessageList";
 import MessageInput from "@/components/MessageInput";
 import OnlineUsers from "@/components/OnlineUsers";
@@ -12,6 +13,8 @@ import OnlineUsers from "@/components/OnlineUsers";
 const SEND_COOLDOWN_MS = 300;
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 8000;
+const TYPING_RESEND_MS = 2000; // jangan spam event typing
+const TYPING_EXPIRE_MS = 4000; // anggap berhenti mengetik jika tak ada sinyal
 
 type Status = "connecting" | "online" | "error";
 
@@ -26,12 +29,24 @@ export default function ChatRoom({ roomId }: { roomId: string }) {
   const [status, setStatus] = useState<Status>("connecting");
   const [items, setItems] = useState<RoomItem[]>([]);
   const [onlineUsers, setOnlineUsers] = useState<string[]>([]);
+  const [typingUsers, setTypingUsers] = useState<string[]>([]);
+  const [readMap, setReadMap] = useState<Record<string, number>>({});
+  const [replyTarget, setReplyTarget] = useState<ChatMessage | null>(null);
   const [copied, setCopied] = useState(false);
+  const [leaveModal, setLeaveModal] = useState(false);
+  const [notifOn, setNotifOn] = useState(false);
+
   const socketRef = useRef<WebSocket | null>(null);
   const lastSentAt = useRef(0);
   const reconnectAttempt = useRef(0);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const closedByUser = useRef(false);
+  const lastTypingSent = useRef(0);
+  const typingOffTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const typingExpiry = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const lastReadSent = useRef(0);
+  const latestMsgTs = useRef(0);
+  const notifOnRef = useRef(false);
 
   // Ambil username dari sessionStorage; tanpa itu kembali ke halaman join
   useEffect(() => {
@@ -44,9 +59,80 @@ export default function ChatRoom({ roomId }: { roomId: string }) {
     setUsername(name);
   }, [router]);
 
+  // Simpan kode room agar bisa masuk lagi (mis. browser HP tertutup)
+  useEffect(() => {
+    if (username) saveRecentRoom(roomId);
+  }, [roomId, username]);
+
+  useEffect(() => {
+    setNotifOn(
+      typeof Notification !== "undefined" &&
+        Notification.permission === "granted" &&
+        localStorage.getItem("sm:notif") === "1"
+    );
+  }, []);
+  useEffect(() => {
+    notifOnRef.current = notifOn;
+  }, [notifOn]);
+
+  const sendRaw = useCallback((msg: ClientMsg) => {
+    const socket = socketRef.current;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(msg));
+    }
+  }, []);
+
+  // Kirim tanda "sudah baca" untuk pesan terbaru (hanya saat tab terlihat)
+  const sendRead = useCallback(() => {
+    const ts = latestMsgTs.current;
+    if (ts <= lastReadSent.current || document.visibilityState !== "visible")
+      return;
+    lastReadSent.current = ts;
+    sendRaw({ t: "read", ts });
+  }, [sendRaw]);
+
   useEffect(() => {
     if (!username) return;
     closedByUser.current = false;
+    const expiryTimers = typingExpiry.current;
+
+    function markTyping(user: string, on: boolean) {
+      const timers = typingExpiry.current;
+      const existing = timers.get(user);
+      if (existing) clearTimeout(existing);
+      if (on) {
+        timers.set(
+          user,
+          setTimeout(() => {
+            timers.delete(user);
+            setTypingUsers((prev) => prev.filter((u) => u !== user));
+          }, TYPING_EXPIRE_MS)
+        );
+        setTypingUsers((prev) => (prev.includes(user) ? prev : [...prev, user]));
+      } else {
+        timers.delete(user);
+        setTypingUsers((prev) => prev.filter((u) => u !== user));
+      }
+    }
+
+    function notify(msg: { username: string; text: string }) {
+      if (
+        !notifOnRef.current ||
+        document.visibilityState === "visible" ||
+        typeof Notification === "undefined" ||
+        Notification.permission !== "granted"
+      )
+        return;
+      try {
+        new Notification(`${msg.username} · ${roomId}`, {
+          body: msg.text,
+          icon: "/icons/icon-192.png",
+          tag: `sm-${roomId}`, // pesan baru menimpa notifikasi lama
+        });
+      } catch {
+        // beberapa platform (Android) butuh SW registration — abaikan
+      }
+    }
 
     function connect() {
       setStatus((prev) => (prev === "online" ? prev : "connecting"));
@@ -63,6 +149,12 @@ export default function ChatRoom({ roomId }: { roomId: string }) {
         if (!msg) return;
 
         if (msg.t === "msg") {
+          latestMsgTs.current = Math.max(latestMsgTs.current, msg.timestamp);
+          markTyping(msg.username, false);
+          if (msg.username !== username) {
+            notify(msg);
+            sendRead();
+          }
           setItems((prev) => [
             ...prev,
             {
@@ -71,6 +163,7 @@ export default function ChatRoom({ roomId }: { roomId: string }) {
               username: msg.username,
               text: msg.text,
               timestamp: msg.timestamp,
+              replyTo: msg.replyTo,
             },
           ]);
         } else if (msg.t === "presence") {
@@ -86,6 +179,16 @@ export default function ChatRoom({ roomId }: { roomId: string }) {
               timestamp: msg.timestamp,
             },
           ]);
+        } else if (msg.t === "typing") {
+          if (msg.username !== username) markTyping(msg.username, msg.on);
+        } else if (msg.t === "read") {
+          if (msg.username !== username) {
+            setReadMap((prev) =>
+              (prev[msg.username] ?? 0) >= msg.ts
+                ? prev
+                : { ...prev, [msg.username]: msg.ts }
+            );
+          }
         }
       };
 
@@ -108,26 +211,59 @@ export default function ChatRoom({ roomId }: { roomId: string }) {
 
     connect();
 
+    function onVisible() {
+      if (document.visibilityState === "visible") sendRead();
+    }
+    document.addEventListener("visibilitychange", onVisible);
+
     return () => {
       closedByUser.current = true;
+      document.removeEventListener("visibilitychange", onVisible);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      if (typingOffTimer.current) clearTimeout(typingOffTimer.current);
+      for (const t of expiryTimers.values()) clearTimeout(t);
+      expiryTimers.clear();
       socketRef.current?.close();
       socketRef.current = null;
     };
-  }, [roomId, username]);
+  }, [roomId, username, sendRaw, sendRead]);
 
-  const sendMessage = useCallback((raw: string): boolean => {
-    const socket = socketRef.current;
-    const text = validateMessage(raw);
-    if (!socket || socket.readyState !== WebSocket.OPEN || !text) return false;
-
+  const handleTyping = useCallback(() => {
     const now = Date.now();
-    if (now - lastSentAt.current < SEND_COOLDOWN_MS) return false;
-    lastSentAt.current = now;
+    if (now - lastTypingSent.current > TYPING_RESEND_MS) {
+      lastTypingSent.current = now;
+      sendRaw({ t: "typing", on: true });
+    }
+    if (typingOffTimer.current) clearTimeout(typingOffTimer.current);
+    typingOffTimer.current = setTimeout(() => {
+      sendRaw({ t: "typing", on: false });
+      lastTypingSent.current = 0;
+    }, TYPING_EXPIRE_MS - 1000);
+  }, [sendRaw]);
 
-    socket.send(JSON.stringify({ t: "msg", text } satisfies ClientMsg));
-    return true;
-  }, []);
+  const sendMessage = useCallback(
+    (raw: string): boolean => {
+      const socket = socketRef.current;
+      const text = validateMessage(raw);
+      if (!socket || socket.readyState !== WebSocket.OPEN || !text) return false;
+
+      const now = Date.now();
+      if (now - lastSentAt.current < SEND_COOLDOWN_MS) return false;
+      lastSentAt.current = now;
+
+      sendRaw({
+        t: "msg",
+        text,
+        ...(replyTarget ? { replyTo: replyTarget.id } : {}),
+      });
+      setReplyTarget(null);
+      if (typingOffTimer.current) clearTimeout(typingOffTimer.current);
+      lastTypingSent.current = 0;
+      sendRaw({ t: "typing", on: false });
+      return true;
+    },
+    [replyTarget, sendRaw]
+  );
 
   async function copyRoomId() {
     try {
@@ -139,7 +275,31 @@ export default function ChatRoom({ roomId }: { roomId: string }) {
     }
   }
 
+  async function toggleNotif() {
+    if (typeof Notification === "undefined") return;
+    if (notifOn) {
+      localStorage.setItem("sm:notif", "0");
+      setNotifOn(false);
+      return;
+    }
+    const perm =
+      Notification.permission === "granted"
+        ? "granted"
+        : await Notification.requestPermission();
+    if (perm === "granted") {
+      localStorage.setItem("sm:notif", "1");
+      setNotifOn(true);
+    }
+  }
+
+  function leaveRoom(forget: boolean) {
+    if (forget) removeRecentRoom(roomId);
+    router.push("/");
+  }
+
   if (!username) return null;
+
+  const othersTyping = typingUsers.filter((u) => u !== username);
 
   return (
     <div className="flex h-dvh flex-col">
@@ -159,18 +319,124 @@ export default function ChatRoom({ roomId }: { roomId: string }) {
               </span>
             </button>
             <p className="truncate text-xs text-muted">
-              {status === "online" && `masuk sebagai ${username}`}
+              {status === "online" &&
+                (othersTyping.length > 0
+                  ? `${othersTyping.join(", ")} sedang mengetik…`
+                  : `masuk sebagai ${username}`)}
               {status === "connecting" && "menghubungkan…"}
               {status === "error" && "koneksi gagal — mencoba lagi…"}
             </p>
           </div>
-          <OnlineUsers users={onlineUsers} self={username} status={status} />
+          <div className="flex shrink-0 items-center gap-2">
+            <OnlineUsers users={onlineUsers} self={username} status={status} />
+            <button
+              onClick={toggleNotif}
+              title={notifOn ? "Matikan notifikasi" : "Nyalakan notifikasi"}
+              aria-label={notifOn ? "Matikan notifikasi" : "Nyalakan notifikasi"}
+              aria-pressed={notifOn}
+              className={`rounded-full border border-line p-2 transition hover:border-accent focus-visible:ring-2 focus-visible:ring-accent ${
+                notifOn ? "text-accent" : "text-muted"
+              }`}
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
+                <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+                {!notifOn && <path d="M2 2 22 22" />}
+              </svg>
+            </button>
+            <button
+              onClick={() => setLeaveModal(true)}
+              title="Keluar room"
+              aria-label="Keluar room"
+              className="rounded-full border border-line p-2 text-muted transition hover:border-danger hover:text-danger focus-visible:ring-2 focus-visible:ring-danger"
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                <path d="m16 17 5-5-5-5" />
+                <path d="M21 12H9" />
+              </svg>
+            </button>
+          </div>
         </div>
       </header>
 
-      <MessageList items={items} self={username} />
+      <MessageList
+        items={items}
+        self={username}
+        readMap={readMap}
+        onReply={setReplyTarget}
+      />
 
-      <MessageInput onSend={sendMessage} disabled={status !== "online"} />
+      <MessageInput
+        onSend={sendMessage}
+        disabled={status !== "online"}
+        onTyping={handleTyping}
+        replyTarget={replyTarget}
+        onCancelReply={() => setReplyTarget(null)}
+      />
+
+      {leaveModal && (
+        <div
+          className="fixed inset-0 z-20 flex items-center justify-center bg-black/40 px-6"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="leave-title"
+          onClick={() => setLeaveModal(false)}
+        >
+          <div
+            className="w-full max-w-sm rounded-2xl border border-line bg-surface p-5 shadow-lg"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="leave-title" className="font-display text-lg font-semibold">
+              Keluar dari room?
+            </h2>
+            <p className="mt-1 text-sm text-muted">
+              Kode <span className="font-code font-bold">{roomId}</span> tersimpan
+              di daftar room. Simpan agar bisa masuk lagi nanti?
+            </p>
+            <div className="mt-5 flex flex-col gap-2">
+              <button
+                onClick={() => leaveRoom(false)}
+                className="w-full rounded-xl bg-accent px-4 py-2.5 font-display font-semibold text-on-accent transition hover:brightness-110 focus-visible:ring-2 focus-visible:ring-accent"
+              >
+                Simpan & keluar
+              </button>
+              <button
+                onClick={() => leaveRoom(true)}
+                className="w-full rounded-xl border border-danger px-4 py-2.5 font-display font-semibold text-danger transition hover:bg-danger/10 focus-visible:ring-2 focus-visible:ring-danger"
+              >
+                Hapus kode & keluar
+              </button>
+              <button
+                onClick={() => setLeaveModal(false)}
+                className="w-full rounded-xl px-4 py-2.5 text-sm text-muted transition hover:text-ink focus-visible:ring-2 focus-visible:ring-accent"
+              >
+                Batal
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

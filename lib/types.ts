@@ -3,6 +3,13 @@ export interface ChatMessage {
   username: string;
   text: string;
   timestamp: number;
+  replyTo?: string;
+}
+
+// Room yang pernah dimasuki, disimpan di localStorage
+export interface RecentRoom {
+  id: string;
+  lastJoined: number;
 }
 
 export interface SystemEvent {

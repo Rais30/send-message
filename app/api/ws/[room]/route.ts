@@ -5,6 +5,7 @@ import { validateRoomId, validateUsername, validateMessage } from "@/lib/validat
 import { encode, decode, type ClientMsg, type ServerEvent } from "@/lib/ws-protocol";
 
 const SEND_COOLDOWN_MS = 300;
+const EVENT_COOLDOWN_MS = 150; // typing/read: cegah broadcast flood
 
 // Endpoint ini hanya untuk upgrade WebSocket. GET HTTP biasa → 426.
 export function GET() {
@@ -15,6 +16,7 @@ export function GET() {
 // ponytail: single-instance. Scale multi-VPS butuh Adapter (Redis pub/sub) dari next-ws.
 const rooms = new Map<string, Map<WebSocket, string>>();
 const lastSentAt = new WeakMap<WebSocket, number>();
+const lastEventAt = new WeakMap<WebSocket, number>();
 
 function usersIn(roomId: string): string[] {
   const room = rooms.get(roomId);
@@ -76,15 +78,43 @@ export function UPGRADE(
   });
   broadcast(roomId, { t: "presence", users: usersIn(roomId) });
 
-  client.on("message", (raw) => {
-    const parsed = decode<ClientMsg>(raw.toString());
-    if (!parsed || parsed.t !== "msg") return;
+  client.on("message", (raw, isBinary) => {
+    // Tolak binary + frame besar sebelum parse (anti memory abuse)
+    if (isBinary) return;
+    const str = raw.toString();
+    if (str.length > 8192) return;
+    const parsed = decode<ClientMsg>(str);
+    if (!parsed) return;
+
+    if (parsed.t === "typing" || parsed.t === "read") {
+      const now = Date.now();
+      if (now - (lastEventAt.get(client) ?? 0) < EVENT_COOLDOWN_MS) return;
+      lastEventAt.set(client, now);
+
+      if (parsed.t === "typing") {
+        broadcast(roomId, { t: "typing", username, on: parsed.on === true });
+      } else {
+        const ts = Number(parsed.ts);
+        if (!Number.isFinite(ts)) return;
+        // Clamp ke sekarang: cegah "sudah dibaca" untuk pesan masa depan
+        broadcast(roomId, { t: "read", username, ts: Math.min(ts, now) });
+      }
+      return;
+    }
+
+    if (parsed.t !== "msg") return;
     const text = validateMessage(String(parsed.text ?? ""));
     if (!text) return;
 
     const now = Date.now();
     if (now - (lastSentAt.get(client) ?? 0) < SEND_COOLDOWN_MS) return;
     lastSentAt.set(client, now);
+
+    // replyTo: hanya string pendek yang diteruskan; client lookup lokal.
+    const replyTo =
+      typeof parsed.replyTo === "string" && parsed.replyTo.length <= 64
+        ? parsed.replyTo
+        : undefined;
 
     // Server yang stamp id/username/timestamp — client tak bisa palsukan.
     broadcast(roomId, {
@@ -93,6 +123,7 @@ export function UPGRADE(
       username,
       text,
       timestamp: now,
+      ...(replyTo ? { replyTo } : {}),
     });
   });
 

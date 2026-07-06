@@ -2,10 +2,24 @@
 // Server otoritatif: id, username, timestamp selalu dibuat server.
 
 // Client → server
-export interface ClientMsg {
+export interface ClientChatMsg {
   t: "msg";
   text: string;
+  replyTo?: string; // id pesan yang dibalas (lookup lokal di client)
 }
+
+export interface ClientTyping {
+  t: "typing";
+  on: boolean;
+}
+
+// "Sudah baca sampai timestamp ini"
+export interface ClientRead {
+  t: "read";
+  ts: number;
+}
+
+export type ClientMsg = ClientChatMsg | ClientTyping | ClientRead;
 
 // Server → client
 export interface ServerMsg {
@@ -14,6 +28,7 @@ export interface ServerMsg {
   username: string;
   text: string;
   timestamp: number;
+  replyTo?: string;
 }
 
 export interface ServerPresence {
@@ -29,7 +44,24 @@ export interface ServerSys {
   timestamp: number;
 }
 
-export type ServerEvent = ServerMsg | ServerPresence | ServerSys;
+export interface ServerTyping {
+  t: "typing";
+  username: string;
+  on: boolean;
+}
+
+export interface ServerRead {
+  t: "read";
+  username: string;
+  ts: number;
+}
+
+export type ServerEvent =
+  | ServerMsg
+  | ServerPresence
+  | ServerSys
+  | ServerTyping
+  | ServerRead;
 
 export function encode(event: ServerEvent | ClientMsg): string {
   return JSON.stringify(event);
